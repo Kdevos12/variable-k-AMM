@@ -1,772 +1,274 @@
 # variable-k-AMM
 A weird tokenomic for an abandonned casino projet ! &lt;3
 
-use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, MintTo, Burn};
+# MGC AMM - Technical Documentation
 
-declare_id!("7eiX7pdAfzK5nBTR6HpJA2BR6BwaWoZ9HHawc5W8Dj7y");
+## Introduction
 
-const PRECISION: u128 = 1_000_000_000; // 10^9 pour les calculs
-const BPS_DENOMINATOR: u128 = 10_000;
-const MAX_FEE_BPS: u128 = 5_000; // 50% maximum
+I started this project somewhat on a whim, driven by pure autism in november 2025?                                   
+The initial idea was to create an AMM system for an online casino on Solana. The core concept was fairly straightforward: use a bonding curve with virtual reserves to manage a token (MGC) that would serve as casino chips. The objective was to have a mechanism where the casino's overall losses would be automatically amortized through the progressive increase of the K constant with each swap. Essentially, the more people play and lose, the more the pool's liquidity increases, which stabilizes the system. However, after reflection, I realized this was simply too much work, too much effort to maintain, and above all, far too legally problematic depending on jurisdiction. So I'm abandoning the casino project, but the code remains interesting from a technical standpoint.
 
-#[program]
-pub mod mgc_token {
-    use super::*;
+From a technical perspective, I implemented a classic "constant" product AMM (x * y = k) but with several specific features. First, virtual reserves to simulate deep liquidity from the start without needing millions of SOL. Second, dynamic fees calculated with a logarithmic approximation that increase based on swap volume to prevent large-scale manipulation. The important aspect is that unlike a standard AMM, K is not constant - it increases with each transaction through fees that remain in the pool. I also added all standard security protections: strict account validation, slippage protection, 24-hour timelock on authorization changes, and complete transparency on real versus virtual reserves. The code is written in Rust with Anchor for Solana.
 
-    pub fn initialize(
-        ctx: Context<Initialize>,
-        initial_sol_reserve: u64,
-        virtual_sol_reserve: u64,
-        virtual_token_supply: u64,
-        base_fee_in_bps: u16,
-        base_fee_out_bps: u16,
-        alpha_in: u64,
-        alpha_out: u64,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        pool.authority = ctx.accounts.authority.key();
-        pool.mint = ctx.accounts.mint.key();
-        pool.sol_reserve = initial_sol_reserve;
-        pool.token_supply = 0;
-        pool.virtual_sol_reserve = virtual_sol_reserve;
-        pool.virtual_token_supply = virtual_token_supply;
-        pool.base_fee_in_bps = base_fee_in_bps;
-        pool.base_fee_out_bps = base_fee_out_bps;
-        pool.alpha_in = alpha_in;
-        pool.alpha_out = alpha_out;
-        
-        let effective_sol = (initial_sol_reserve as u128)
-            .checked_add(virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        let effective_token = virtual_token_supply as u128;
-        
-        pool.k_constant = effective_sol
-            .checked_mul(effective_token)
-            .ok_or(ErrorCode::MathOverflow)?;
+---
 
-        pool.authorized_minters = Vec::new();
-        pool.authorized_burners = Vec::new();
-        
-        Ok(())
-    }
+## Mathematical Documentation
 
-    /// Ajouter un contrat autorisé pour le minting
-    pub fn add_authorized_minter(
-        ctx: Context<ManageAuthorization>,
-        minter: Pubkey,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        require!(
-            ctx.accounts.authority.key() == pool.authority,
-            ErrorCode::Unauthorized
-        );
-        
-        if !pool.authorized_minters.contains(&minter) {
-            pool.authorized_minters.push(minter);
-        }
-        
-        Ok(())
-    }
+### 1. Bonding Curve with Virtual Reserves
 
-    /// Ajouter un contrat autorisé pour le burning
-    pub fn add_authorized_burner(
-        ctx: Context<ManageAuthorization>,
-        burner: Pubkey,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        require!(
-            ctx.accounts.authority.key() == pool.authority,
-            ErrorCode::Unauthorized
-        );
-        
-        if !pool.authorized_burners.contains(&burner) {
-            pool.authorized_burners.push(burner);
-        }
-        
-        Ok(())
-    }
+**Core principle:**
+```
+R_eff = R_real + R_virtual
+S_eff = S_real + S_virtual
 
-    /// Mint de tokens (réservé aux contrats autorisés)
-    pub fn authorized_mint(
-        ctx: Context<AuthorizedMint>,
-        amount: u64,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        
-        require!(
-            pool.authorized_minters.contains(&ctx.accounts.caller.key()),
-            ErrorCode::UnauthorizedMinter
-        );
+K = R_eff × S_eff
+```
 
-        let seeds = &[b"pool_v5".as_ref(), &[ctx.bumps.pool]];
-        let signer = &[&seeds[..]];
-        
-        let cpi_accounts = MintTo {
-            mint: ctx.accounts.mint.to_account_info(),
-            to: ctx.accounts.destination.to_account_info(),
-            authority: pool.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        
-        token::mint_to(cpi_ctx, amount)?;
-        
-        // Mettre à jour token_supply avec checked_add
-        pool.token_supply = pool.token_supply
-            .checked_add(amount)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        // Recalculer k avec réserves virtuelles
-        let effective_sol = (pool.sol_reserve as u128)
-            .checked_add(pool.virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        let effective_token = (pool.token_supply as u128)
-            .checked_add(pool.virtual_token_supply as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        pool.k_constant = effective_sol
-            .checked_mul(effective_token)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        Ok(())
-    }
+Where:
+- `R_eff` = Effective SOL reserve
+- `R_real` = Real SOL reserve (available for withdrawal)
+- `R_virtual` = Virtual SOL reserve (liquidity simulation)
+- `S_eff` = Effective token supply
+- `S_real` = Real supply
+- `S_virtual` = Virtual supply
 
-    /// Burn de tokens (réservé aux contrats autorisés)
-    pub fn authorized_burn(
-        ctx: Context<AuthorizedBurn>,
-        amount: u64,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        
-        require!(
-            pool.authorized_burners.contains(&ctx.accounts.caller.key()),
-            ErrorCode::UnauthorizedBurner
-        );
+### 2. SOL → MGC Swap (Token Purchase)
 
-        let cpi_accounts = Burn {
-            mint: ctx.accounts.mint.to_account_info(),
-            from: ctx.accounts.source.to_account_info(),
-            authority: ctx.accounts.caller.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        
-        token::burn(cpi_ctx, amount)?;
-        
-        // Mettre à jour token_supply avec checked_sub
-        pool.token_supply = pool.token_supply
-            .checked_sub(amount)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        // Recalculer k avec réserves virtuelles
-        let effective_sol = (pool.sol_reserve as u128)
-            .checked_add(pool.virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        let effective_token = (pool.token_supply as u128)
-            .checked_add(pool.virtual_token_supply as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        pool.k_constant = effective_sol
-            .checked_mul(effective_token)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        Ok(())
-    }
+**Steps:**
 
-    /// Acheter des MGC avec des SOL (swap SOL → MGC)
-    pub fn buy_tokens(
-        ctx: Context<BuyTokens>,
-        sol_amount: u64,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        
-        require!(sol_amount > 0, ErrorCode::InvalidAmount);
-        
-        // Calculer les frais d'entrée dynamiques en u128
-        // Note: calculate_entry_fee uses reserve ratio. We should use effective reserve?
-        // For fees, maybe real reserve is better? Or effective?
-        // Let's use effective reserve for stability.
-        let effective_sol_reserve = (pool.sol_reserve as u128)
-            .checked_add(pool.virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
+1. **Entry fee calculation:**
+   ```
+   ratio = (amount_in × 10^9) / R_eff
+   log_approx(x) ≈ x - x²/2 + x³/3
+   f_in = f_base + α_in × log(1 + ratio)
+   f_in = min(f_in, 50%)  // Capped at 50%
+   ```
 
-        let fee_bps = calculate_entry_fee(
-            sol_amount,
-            effective_sol_reserve as u64, // Cast safe if u64
-            pool.base_fee_in_bps,
-            pool.alpha_in,
-        )?;
-        
-        // Calculer les frais en u128 pour éviter les erreurs de rounding
-        let sol_amount_u128 = sol_amount as u128;
-        let fee_amount_u128 = sol_amount_u128
-            .checked_mul(fee_bps)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(BPS_DENOMINATOR)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        let fee_amount = fee_amount_u128 as u64;
-        let sol_after_fee = sol_amount
-            .checked_sub(fee_amount)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        require!(sol_after_fee > 0, ErrorCode::FeeTooHigh);
-        
-        // Formule AMM: tokens_out = supply - (k / (reserve + sol_in))
-        let new_effective_reserve = effective_sol_reserve
-            .checked_add(sol_after_fee as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        // new_supply = k / new_reserve
-        let new_effective_supply = pool.k_constant
-            .checked_div(new_effective_reserve)
-            .ok_or(ErrorCode::DivisionByZero)?;
-        
-        // tokens_to_mint = current_supply - new_supply
-        let current_effective_supply = (pool.token_supply as u128)
-            .checked_add(pool.virtual_token_supply as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        // Protection
-        require!(
-            current_effective_supply > new_effective_supply,
-            ErrorCode::InvalidAMMState
-        );
-        
-        let tokens_to_mint_u128 = current_effective_supply
-            .checked_sub(new_effective_supply)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        require!(tokens_to_mint_u128 <= u64::MAX as u128, ErrorCode::MathOverflow);
-        let tokens_to_mint = tokens_to_mint_u128 as u64;
-        
-        require!(tokens_to_mint > 0, ErrorCode::InvalidAmount);
+2. **Amount after fees:**
+   ```
+   sol_after_fee = sol_amount × (1 - f_in)
+   ```
 
-        // Transférer les SOL de l'utilisateur vers le pool
-        let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.buyer.key(),
-            &pool.key(),
-            sol_amount,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &transfer_ix,
-            &[
-                ctx.accounts.buyer.to_account_info(),
-                pool.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
+3. **Tokens to mint calculation:**
+   ```
+   R_new = R_eff + sol_after_fee
+   S_new = K / R_new
+   tokens_out = S_eff - S_new
+   ```
 
-        // Mint les tokens MGC
-        let seeds = &[b"pool_v5".as_ref(), &[ctx.bumps.pool]];
-        let signer = &[&seeds[..]];
-        
-        let cpi_accounts = MintTo {
-            mint: ctx.accounts.mint.to_account_info(),
-            to: ctx.accounts.buyer_token_account.to_account_info(),
-            authority: pool.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        
-        token::mint_to(cpi_ctx, tokens_to_mint)?;
+4. **K update (increase via fees):**
+   ```
+   R_real_new = R_real + sol_after_fee
+   S_real_new = S_real + tokens_out
+   K_new = (R_real_new + R_virtual) × (S_real_new + S_virtual)
+   ```
 
-        // Mettre à jour l'état du pool
-        pool.sol_reserve = pool.sol_reserve
-            .checked_add(sol_after_fee)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        pool.token_supply = pool.token_supply
-            .checked_add(tokens_to_mint)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        // Recalculer k (fees increase liquidity)
-        let final_effective_sol = (pool.sol_reserve as u128)
-            .checked_add(pool.virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        let final_effective_token = (pool.token_supply as u128)
-            .checked_add(pool.virtual_token_supply as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        pool.k_constant = final_effective_sol
-            .checked_mul(final_effective_token)
-            .ok_or(ErrorCode::MathOverflow)?;
+### 3. MGC → SOL Swap (Token Sale)
 
-        emit!(TokenPurchased {
-            buyer: ctx.accounts.buyer.key(),
-            sol_amount,
-            fee_amount,
-            tokens_received: tokens_to_mint,
-            new_price: calculate_price(
-                pool.sol_reserve, 
-                pool.token_supply,
-                pool.virtual_sol_reserve,
-                pool.virtual_token_supply
-            )?,
-        });
+**Steps:**
 
-        Ok(())
-    }
+1. **SOL output calculation (before fees):**
+   ```
+   S_new = S_eff + token_amount
+   R_new = K / S_new
+   sol_out_before_fee = R_eff - R_new
+   ```
 
-    /// Vendre des MGC contre des SOL (swap MGC → SOL)
-    pub fn sell_tokens(
-        ctx: Context<SellTokens>,
-        token_amount: u64,
-    ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        
-        require!(token_amount > 0, ErrorCode::InvalidAmount);
-        require!(pool.token_supply > 0, ErrorCode::InvalidAMMState);
-        require!(pool.sol_reserve > 0, ErrorCode::InsufficientReserve);
-        require!(pool.k_constant > 0, ErrorCode::InvalidAMMState);
-        
-        // Calculer le montant de SOL selon la bonding curve
-        let effective_token_supply = (pool.token_supply as u128)
-            .checked_add(pool.virtual_token_supply as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        let new_effective_supply = effective_token_supply
-            .checked_add(token_amount as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        require!(new_effective_supply > 0, ErrorCode::InvalidAMMState);
-        
-        // new_reserve = k / new_supply
-        let new_effective_reserve = pool.k_constant
-            .checked_div(new_effective_supply)
-            .ok_or(ErrorCode::DivisionByZero)?;
-        
-        let effective_sol_reserve = (pool.sol_reserve as u128)
-            .checked_add(pool.virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        // Protection: new_reserve doit être < current_reserve
-        require!(
-            new_effective_reserve < effective_sol_reserve,
-            ErrorCode::InvalidAMMState
-        );
-        
-        let sol_out_before_fee_u128 = effective_sol_reserve
-            .checked_sub(new_effective_reserve)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        require!(
-            sol_out_before_fee_u128 <= u64::MAX as u128,
-            ErrorCode::MathOverflow
-        );
-        let sol_out_before_fee = sol_out_before_fee_u128 as u64;
-        
-        require!(sol_out_before_fee > 0, ErrorCode::InvalidAmount);
-        
-        // Calculer les frais de sortie dynamiques
-        let fee_bps = calculate_exit_fee(
-            sol_out_before_fee,
-            effective_sol_reserve as u64, // Use effective reserve
-            pool.base_fee_out_bps,
-            pool.alpha_out,
-        )?;
-        
-        // Calculer les frais en u128
-        let fee_amount_u128 = (sol_out_before_fee as u128)
-            .checked_mul(fee_bps)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(BPS_DENOMINATOR)
-            .ok_or(ErrorCode::MathOverflow)?;
-        
-        let fee_amount = fee_amount_u128 as u64;
-        let sol_to_transfer = sol_out_before_fee
-            .checked_sub(fee_amount)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        require!(sol_to_transfer > 0, ErrorCode::FeeTooHigh);
-        require!(
-            pool.sol_reserve >= sol_out_before_fee, // Must have enough REAL SOL
-            ErrorCode::InsufficientReserve
-        );
+2. **Exit fee calculation:**
+   ```
+   ratio = (sol_out × 10^9) / R_eff
+   f_out = f_base + α_out × log(1 + ratio)
+   f_out = min(f_out, 50%)
+   ```
 
-        // Burn les tokens MGC
-        let cpi_accounts = Burn {
-            mint: ctx.accounts.mint.to_account_info(),
-            from: ctx.accounts.seller_token_account.to_account_info(),
-            authority: ctx.accounts.seller.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        
-        token::burn(cpi_ctx, token_amount)?;
+3. **Final amount:**
+   ```
+   sol_to_user = sol_out_before_fee × (1 - f_out)
+   ```
 
-        // Transférer les SOL du pool vers le vendeur
-        **pool.to_account_info().try_borrow_mut_lamports()? = pool
-            .to_account_info()
-            .lamports()
-            .checked_sub(sol_to_transfer)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        **ctx.accounts.seller.to_account_info().try_borrow_mut_lamports()? = ctx
-            .accounts
-            .seller
-            .to_account_info()
-            .lamports()
-            .checked_add(sol_to_transfer)
-            .ok_or(ErrorCode::MathOverflow)?;
+4. **K update (fees remain in pool):**
+   ```
+   R_real_new = R_real - sol_out_before_fee
+   S_real_new = S_real - token_amount
+   K_new = (R_real_new + R_virtual) × (S_real_new + S_virtual)
+   ```
 
-        // Mettre à jour l'état du pool avec checked operations
-        pool.sol_reserve = pool.sol_reserve
-            .checked_sub(sol_out_before_fee)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        pool.token_supply = pool.token_supply
-            .checked_sub(token_amount)
-            .ok_or(ErrorCode::MathUnderflow)?;
-        
-        // Recalculer k (fees stay in pool, increasing K)
-        let final_effective_sol = (pool.sol_reserve as u128)
-            .checked_add(pool.virtual_sol_reserve as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        let final_effective_token = (pool.token_supply as u128)
-            .checked_add(pool.virtual_token_supply as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        pool.k_constant = final_effective_sol
-            .checked_mul(final_effective_token)
-            .ok_or(ErrorCode::MathOverflow)?;
+### 4. Spot Price
 
-        emit!(TokenSold {
-            seller: ctx.accounts.seller.key(),
-            tokens_sold: token_amount,
-            sol_received: sol_to_transfer,
-            fee_amount,
-            new_price: calculate_price(
-                pool.sol_reserve, 
-                pool.token_supply,
-                pool.virtual_sol_reserve,
-                pool.virtual_token_supply
-            )?,
-        });
+```
+price = R_eff / S_eff × 10^9
+```
 
-        Ok(())
-    }
-}
+Price in lamports per token, multiplied by 10^9 for precision.
 
-// Calcul des frais d'entrée dynamiques avec gestion complète des erreurs
-fn calculate_entry_fee(
-    amount_in: u64,
-    reserve: u64,
-    base_fee_bps: u16,
-    alpha: u64,
-) -> Result<u128> {
-    require!(reserve > 0, ErrorCode::DivisionByZero);
-    
-    // f_in = f_base + α · log(1 + ΔMint / R_pool)
-    let ratio = (amount_in as u128)
-        .checked_mul(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(reserve as u128)
-        .ok_or(ErrorCode::DivisionByZero)?;
-    
-    let log_approx = approximate_log(ratio)?;
-    
-    let dynamic_component = (alpha as u128)
-        .checked_mul(log_approx)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    let total_fee = (base_fee_bps as u128)
-        .checked_add(dynamic_component)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    // Cap à MAX_FEE_BPS (50%)
-    Ok(std::cmp::min(total_fee, MAX_FEE_BPS))
-}
+### 5. Key Mathematical Property
 
-// Calcul des frais de sortie dynamiques
-fn calculate_exit_fee(
-    amount_out: u64,
-    reserve: u64,
-    base_fee_bps: u16,
-    alpha: u64,
-) -> Result<u128> {
-    require!(reserve > 0, ErrorCode::DivisionByZero);
-    
-    // f_out = f_base + α · log(1 + R_out / R_pool)
-    let ratio = (amount_out as u128)
-        .checked_mul(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(reserve as u128)
-        .ok_or(ErrorCode::DivisionByZero)?;
-    
-    let log_approx = approximate_log(ratio)?;
-    
-    let dynamic_component = (alpha as u128)
-        .checked_mul(log_approx)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    let total_fee = (base_fee_bps as u128)
-        .checked_add(dynamic_component)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    // Cap à MAX_FEE_BPS (50%)
-    Ok(std::cmp::min(total_fee, MAX_FEE_BPS))
-}
+**K increases with each swap:**
+```
+ΔK = fee_amount × S_eff  (for buy)
+ΔK = fee_amount × S_eff  (for sell)
+```
 
-// Approximation du logarithme naturel avec gestion d'erreurs
-fn approximate_log(x: u128) -> Result<u128> {
-    // Approximation de ln(1 + x) pour x petit: ln(1+x) ≈ x - x²/2 + x³/3
-    if x == 0 {
-        return Ok(0);
-    }
-    
-    let x_squared = x
-        .checked_mul(x)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    let x_cubed = x_squared
-        .checked_mul(x)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    let term2 = x_squared
-        .checked_div(2)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    let term3 = x_cubed
-        .checked_div(3)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    let result = x
-        .checked_sub(term2)
-        .ok_or(ErrorCode::MathUnderflow)?
-        .checked_add(term3)
-        .ok_or(ErrorCode::MathOverflow)?;
-    
-    Ok(result)
-}
+This accumulation effect enables loss amortization in the casino context.
 
-// Calculer le prix actuel (SOL par MGC, scaled by PRECISION)
-fn calculate_price(
-    sol_reserve: u64, 
-    token_supply: u64,
-    virtual_sol: u64,
-    virtual_token: u64
-) -> Result<u64> {
-    let effective_sol = (sol_reserve as u128)
-        .checked_add(virtual_sol as u128)
-        .ok_or(ErrorCode::MathOverflow)?;
-        
-    let effective_token = (token_supply as u128)
-        .checked_add(virtual_token as u128)
-        .ok_or(ErrorCode::MathOverflow)?;
+---
 
-    if effective_token == 0 {
-        return Ok(0);
-    }
-    
-    let price_u128 = effective_sol
-        .checked_mul(PRECISION)
-        .ok_or(ErrorCode::MathOverflow)?
-        .checked_div(effective_token)
-        .ok_or(ErrorCode::DivisionByZero)?;
-    
-    require!(price_u128 <= u64::MAX as u128, ErrorCode::MathOverflow);
-    Ok(price_u128 as u64)
-}
+## IT Documentation
 
-#[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + Pool::INIT_SPACE,
-        seeds = [b"pool_v5"],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    
-    /// CHECK: token Mint account - will be initialized via CPI
-    pub mint: UncheckedAccount<'info>,
-    
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    
-    pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub rent: Sysvar<'info, Rent>,
-}
+### Architecture
 
-#[derive(Accounts)]
-pub struct ManageAuthorization<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool_v5"],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    
-    pub authority: Signer<'info>,
-}
+**Program:** `mgc_token` (Solana/Anchor)
+**Language:** Rust
+**Framework:** Anchor 0.29
+**Binary size:** 309 KB
 
-#[derive(Accounts)]
-pub struct AuthorizedMint<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool_v5"],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    
-    /// CHECK: token Mint account
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-    
-    /// CHECK: destination token account owned by Token program
-    #[account(mut)]
-    pub destination: UncheckedAccount<'info>,
-    
-    pub caller: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
+### Main Structures
 
-#[derive(Accounts)]
-pub struct AuthorizedBurn<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool_v5"],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    
-    /// CHECK: token Mint account
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-    
-    /// CHECK: source token account owned by Token program
-    #[account(mut)]
-    pub source: UncheckedAccount<'info>,
-    
-    pub caller: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct BuyTokens<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool_v5"],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    
-    /// CHECK: token Mint account
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-    
-    #[account(mut)]
-    pub buyer: Signer<'info>,
-    
-    /// CHECK: buyer token account owned by Token program
-    #[account(mut)]
-    pub buyer_token_account: UncheckedAccount<'info>,
-    
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct SellTokens<'info> {
-    #[account(
-        mut,
-        seeds = [b"pool_v5"],
-        bump
-    )]
-    pub pool: Account<'info, Pool>,
-    
-    /// CHECK: token Mint account
-    #[account(mut)]
-    pub mint: UncheckedAccount<'info>,
-    
-    #[account(mut)]
-    pub seller: Signer<'info>,
-    
-    /// CHECK: seller token account owned by Token program
-    #[account(mut)]
-    pub seller_token_account: UncheckedAccount<'info>,
-    
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
-
-#[account]
-#[derive(InitSpace)]
+```rust
 pub struct Pool {
-    pub authority: Pubkey,
-    pub mint: Pubkey,
-    pub sol_reserve: u64,
-    pub token_supply: u64,
-    pub k_constant: u128, // En u128 pour éviter overflow
-    pub base_fee_in_bps: u16,
-    pub base_fee_out_bps: u16,
-    pub alpha_in: u64,
-    pub alpha_out: u64,
-    pub virtual_sol_reserve: u64,
-    pub virtual_token_supply: u64,
-    #[max_len(10)]
-    pub authorized_minters: Vec<Pubkey>,
-    #[max_len(10)]
-    pub authorized_burners: Vec<Pubkey>,
+    authority: Pubkey,           // Pool authority
+    mint: Pubkey,                // MGC token mint
+    sol_reserve: u64,            // Real SOL reserve
+    token_supply: u64,           // Real supply
+    k_constant: u128,            // K constant (variable)
+    base_fee_in_bps: u16,        // Base entry fee (bps)
+    base_fee_out_bps: u16,       // Base exit fee (bps)
+    alpha_in: u64,               // Entry dynamic coefficient
+    alpha_out: u64,              // Exit dynamic coefficient
+    virtual_sol_reserve: u64,    // Virtual SOL reserve
+    virtual_token_supply: u64,   // Virtual supply
+    authorized_minters: Vec<Pubkey>,        // Max 10
+    authorized_burners: Vec<Pubkey>,        // Max 10
+    pending_authorizations: Vec<PendingAuthorization>, // Max 5
 }
 
-#[event]
-pub struct TokenPurchased {
-    pub buyer: Pubkey,
-    pub sol_amount: u64,
-    pub fee_amount: u64,
-    pub tokens_received: u64,
-    pub new_price: u64,
+pub struct PendingAuthorization {
+    address: Pubkey,
+    proposed_at: i64,
+    auth_type: AuthorizationType,  // Minter | Burner
+}
+```
+
+### Instructions
+
+| Instruction | Parameters | Description |
+|-------------|------------|-------------|
+| `initialize` | `initial_sol_reserve, virtual_sol_reserve, virtual_token_supply, base_fee_in_bps, base_fee_out_bps, alpha_in, alpha_out` | Initialize pool |
+| `buy_tokens` | `sol_amount, min_tokens_out` | SOL → MGC swap with slippage protection |
+| `sell_tokens` | `token_amount, min_sol_out` | MGC → SOL swap with slippage protection |
+| `propose_authorized_minter` | `minter` | Propose minter (24h timelock) |
+| `propose_authorized_burner` | `burner` | Propose burner (24h timelock) |
+| `execute_pending_authorization` | `pending_address` | Execute after 24h |
+| `cancel_pending_authorization` | `pending_address` | Cancel proposal |
+| `authorized_mint` | `amount` | Mint reserved for authorized contracts |
+| `authorized_burn` | `amount` | Burn reserved for authorized contracts |
+| `get_pool_info` | - | Return complete info (view) |
+
+### Implemented Security Features
+
+- ✅ **Account validation:** `Account<Mint>`, `Account<TokenAccount>` with constraints
+- ✅ **Slippage protection:** `min_tokens_out` / `min_sol_out` required
+- ✅ **Secure transfers:** `system_program::transfer` + `invoke_signed`
+- ✅ **24h timelock:** On authorization changes (86400s)
+- ✅ **Checked math:** All calculations with `checked_add/sub/mul/div`
+- ✅ **Transparency:** Events with real + virtual reserves
+
+### Events
+
+```rust
+TokenPurchased {
+    buyer, sol_amount, fee_amount, tokens_received, new_price,
+    real_sol_reserve, real_token_supply,
+    virtual_sol_reserve, virtual_token_supply
 }
 
-#[event]
-pub struct TokenSold {
-    pub seller: Pubkey,
-    pub tokens_sold: u64,
-    pub sol_received: u64,
-    pub fee_amount: u64,
-    pub new_price: u64,
+TokenSold {
+    seller, tokens_sold, sol_received, fee_amount, new_price,
+    real_sol_reserve, real_token_supply,
+    virtual_sol_reserve, virtual_token_supply
 }
+```
 
-#[error_code]
-pub enum ErrorCode {
-    #[msg("Non autorisé")]
-    Unauthorized,
-    #[msg("Minter non autorisé")]
-    UnauthorizedMinter,
-    #[msg("Burner non autorisé")]
-    UnauthorizedBurner,
-    #[msg("Réserve de SOL insuffisante")]
-    InsufficientReserve,
-    #[msg("Overflow mathématique")]
-    MathOverflow,
-    #[msg("Underflow mathématique")]
-    MathUnderflow,
-    #[msg("Division par zéro")]
-    DivisionByZero,
-    #[msg("Montant invalide")]
-    InvalidAmount,
-    #[msg("État AMM invalide")]
-    InvalidAMMState,
-    #[msg("Réserve invalide")]
-    InvalidReserve,
-    #[msg("Frais trop élevés")]
-    FeeTooHigh,
-}
+### Constants
+
+```rust
+PRECISION: u128 = 1_000_000_000     // 10^9 for calculations
+BPS_DENOMINATOR: u128 = 10_000      // Basis points
+MAX_FEE_BPS: u128 = 5_000           // 50% max
+TIMELOCK_DELAY: i64 = 86400         // 24 hours
+```
+
+### PDA
+
+```
+Pool: ["pool_v5"]
+```
+
+### Error Codes
+
+| Code | Message |
+|------|---------|
+| `Unauthorized` | Unauthorized |
+| `UnauthorizedMinter` | Unauthorized minter |
+| `UnauthorizedBurner` | Unauthorized burner |
+| `InsufficientReserve` | Insufficient SOL reserve |
+| `MathOverflow` | Mathematical overflow |
+| `MathUnderflow` | Mathematical underflow |
+| `SlippageExceeded` | Slippage exceeded |
+| `InvalidMint` | Invalid mint |
+| `InvalidTokenAccount` | Invalid token account |
+| `AlreadyAuthorized` | Already authorized |
+| `AlreadyPending` | Already pending |
+| `NoPendingAuthorization` | No pending authorization |
+| `TimelockNotExpired` | Timelock not expired |
+
+### Build & Deploy
+
+```bash
+# Build
+anchor build
+
+# Deploy
+anchor deploy --provider.cluster devnet
+
+# Test (requires update for new API)
+anchor test
+```
+
+### Known Limitations
+
+- Pool size increases with pending_authorizations (max 5)
+- Variable K makes returning to initial state impossible
+- Virtual reserves not modifiable after initialization
+- Fees capped at 50% (no governance to modify)
+
+### Implementation Notes
+
+**Solved Issue - Borrow Checker:**
+In `execute_pending_authorization`, values (`address`, `auth_type`, `proposed_at`) are copied before pool modification to avoid simultaneous immutable/mutable borrows.
+
+**Breaking Changes vs Original API:**
+- `add_authorized_minter` → `propose_authorized_minter`
+- `add_authorized_burner` → `propose_authorized_burner`
+- `buy_tokens(amount)` → `buy_tokens(amount, min_out)`
+- `sell_tokens(amount)` → `sell_tokens(amount, min_out)`
+
+---
+
+## File Structure
+
+```
+programs/mgc_token/
+├── src/
+│   └── lib.rs          # Main code (938 lines)
+├── Cargo.toml
+└── target/deploy/
+    └── mgc_token.so    # Compiled binary (309 KB)
+```
+
+## Status
+
+**Compiled:** ✅
+**Tested:** ⚠️ Existing tests require API update
+**Deployed:** ❌
+**Project:** Abandoned (legal concerns)

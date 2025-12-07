@@ -255,20 +255,4 @@ In `execute_pending_authorization`, values (`address`, `auth_type`, `proposed_at
 
 ---
 
-## File Structure
 
-```
-programs/mgc_token/
-├── src/
-│   └── lib.rs          # Main code (938 lines)
-├── Cargo.toml
-└── target/deploy/
-    └── mgc_token.so    # Compiled binary (309 KB)
-```
-
-## Status
-
-**Compiled:** ✅
-**Tested:** ⚠️ Existing tests require API update
-**Deployed:** ❌
-**Project:** Abandoned (legal concerns)

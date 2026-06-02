@@ -1,5 +1,5 @@
 # variable-k-AMM
-A weird tokenomic for an abandonned casino projet ! &lt;3
+A weird tokenomic for an abandonned casino project ! &lt;3
 
 # MGC AMM - Technical Documentation
 
